@@ -1,0 +1,11 @@
+﻿videos/peleas/
+videos/agresiones/
+videos/saludos/
+videos/neutros/
+videos/esqueletos/
+modelos/dataset/
+modelos/*.pth
+*.zip
+*.npy
+yolov8n-pose.pt
+*.crdownload
