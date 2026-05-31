@@ -1,155 +1,144 @@
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
 from pathlib import Path
 
 # ============================================================
-# LEGION IA — Entrenamiento LSTM v2 (34 features, compatible YOLO)
+# LEGION IA — Dataset con 17 joints x 2 coords x 2 personas
+# = 68 features (interaccion entre dos personas)
 # ============================================================
 
 BASE    = Path(r"C:\Users\accas\legion-ia")
 DATASET = BASE / "modelos" / "dataset"
-MODELOS = BASE / "modelos"
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CLASES = ["SEGURA", "PRECAUCION", "PELIGRO"]
+CATEGORIAS = {
+    "agresiones": {"etiqueta": 2, "nivel": "PELIGRO"},
+    "neutros":    {"etiqueta": 1, "nivel": "PRECAUCION"},
+    "saludos":    {"etiqueta": 0, "nivel": "SEGURA"},
+}
 
-print(f"🖥️  Dispositivo: {DEVICE}")
+# Mapeo NTU (25 joints) → YOLO (17 joints)
+NTU_A_YOLO = [
+    3, 3, 3, 3, 3,
+    4, 8, 5, 9, 6, 10,
+    12, 16, 13, 17, 14, 18,
+]
 
-# 1. Cargar dataset v2
-print("\n📂 Cargando dataset v2...")
-X = np.load(DATASET / "X_skeleton_v2.npy")  # (10404, 30, 34)
-y = np.load(DATASET / "y_skeleton_v2.npy")
+NUM_JOINTS = 17
+FRAMES_SEQ = 30
 
-print(f"  X: {X.shape}")
-print(f"  Clase 0 SEGURA:     {np.sum(y==0)}")
-print(f"  Clase 1 PRECAUCION: {np.sum(y==1)}")
-print(f"  Clase 2 PELIGRO:    {np.sum(y==2)}")
+def leer_skeleton(ruta):
+    with open(ruta, 'r') as f:
+        lineas = f.read().strip().split('\n')
 
-# 2. Dividir dataset
-X_train, X_temp, y_train, y_temp = train_test_split(
-    X, y, test_size=0.3, random_state=42, stratify=y)
-X_val, X_test, y_val, y_test = train_test_split(
-    X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
+    idx = 0
+    num_frames = int(lineas[idx]); idx += 1
+    frames = []
 
-print(f"\n📊 División:")
-print(f"  Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+    for _ in range(num_frames):
+        num_personas = int(lineas[idx]); idx += 1
+        personas_frame = []
 
-# 3. Tensores
-def to_tensor(X, y):
-    return TensorDataset(
-        torch.tensor(X, dtype=torch.float32),
-        torch.tensor(y, dtype=torch.long)
-    )
+        for p in range(num_personas):
+            idx += 1
+            num_joints = int(lineas[idx]); idx += 1
+            joints_25 = []
 
-train_loader = DataLoader(to_tensor(X_train, y_train), batch_size=32, shuffle=True)
-val_loader   = DataLoader(to_tensor(X_val,   y_val),   batch_size=32)
-test_loader  = DataLoader(to_tensor(X_test,  y_test),  batch_size=32)
+            for _ in range(num_joints):
+                vals = lineas[idx].split(); idx += 1
+                x, y = float(vals[0]), float(vals[1])
+                joints_25.append([x, y])
 
-# 4. Modelo LSTM (input_size=34)
-class LegionLSTM(nn.Module):
-    def __init__(self, input_size=34, hidden_size=128,
-                 num_layers=2, num_classes=3):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size, hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=0.3
-        )
-        self.bn   = nn.BatchNorm1d(hidden_size)
-        self.fc1  = nn.Linear(hidden_size, 64)
-        self.relu = nn.ReLU()
-        self.drop = nn.Dropout(0.2)
-        self.fc2  = nn.Linear(64, num_classes)
+            if len(joints_25) >= 19:
+                joints_17 = np.array(
+                    [joints_25[ntu_idx] for ntu_idx in NTU_A_YOLO],
+                    dtype=np.float32)
+                personas_frame.append(joints_17)
 
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]
-        out = self.bn(out)
-        out = self.relu(self.fc1(out))
-        out = self.drop(out)
-        return self.fc2(out)
+        # Siempre 2 personas — rellenar con ceros si falta
+        while len(personas_frame) < 2:
+            personas_frame.append(np.zeros((NUM_JOINTS, 2), dtype=np.float32))
 
-model     = LegionLSTM().to(DEVICE)
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, patience=5, factor=0.5)
+        frames.append(personas_frame[:2])
 
-print(f"\n🧠 Modelo LSTM v2 — input_size=34")
-print(f"  Parámetros: {sum(p.numel() for p in model.parameters()):,}")
+    return frames
 
-# 5. Entrenamiento
-def evaluar(loader):
-    model.eval()
-    correctos, total, loss_total = 0, 0, 0.0
-    with torch.no_grad():
-        for X_b, y_b in loader:
-            X_b, y_b = X_b.to(DEVICE), y_b.to(DEVICE)
-            out  = model(X_b)
-            loss = criterion(out, y_b)
-            loss_total += loss.item()
-            correctos  += (out.argmax(1) == y_b).sum().item()
-            total      += len(y_b)
-    return loss_total / len(loader), correctos / total
+def normalizar_persona(joints):
+    cadera = (joints[11] + joints[12]) / 2
+    hombro = (joints[5]  + joints[6])  / 2
+    escala = np.linalg.norm(hombro - cadera) + 1e-6
+    return ((joints - cadera) / escala).flatten()
 
-print("\n🚀 Entrenando...")
-mejor_val_acc = 0.0
-paciencia     = 0
-PACIENCIA_MAX = 10
-
-for epoch in range(1, 51):
-    model.train()
-    for X_b, y_b in train_loader:
-        X_b, y_b = X_b.to(DEVICE), y_b.to(DEVICE)
-        optimizer.zero_grad()
-        loss = criterion(model(X_b), y_b)
-        loss.backward()
-        optimizer.step()
-
-    train_loss, train_acc = evaluar(train_loader)
-    val_loss,   val_acc   = evaluar(val_loader)
-    scheduler.step(val_loss)
-
-    print(f"  Epoch {epoch:02d}/50 — "
-          f"train_acc: {train_acc*100:.1f}% — "
-          f"val_acc: {val_acc*100:.1f}%")
-
-    if val_acc > mejor_val_acc:
-        mejor_val_acc = val_acc
-        torch.save(model.state_dict(),
-                   MODELOS / "legion_lstm_v2_best.pth")
-        paciencia = 0
+def normalizar_secuencia(frames):
+    if len(frames) >= FRAMES_SEQ:
+        indices = np.linspace(0, len(frames)-1, FRAMES_SEQ, dtype=int)
+        frames  = [frames[i] for i in indices]
     else:
-        paciencia += 1
-        if paciencia >= PACIENCIA_MAX:
-            print(f"\n  Early stopping en epoch {epoch}")
-            break
+        while len(frames) < FRAMES_SEQ:
+            frames.append(frames[-1])
 
-# 6. Evaluación final
-print(f"\n📈 Mejor val_accuracy: {mejor_val_acc*100:.2f}%")
-model.load_state_dict(torch.load(
-    MODELOS / "legion_lstm_v2_best.pth",
-    map_location=DEVICE))
-_, test_acc = evaluar(test_loader)
-print(f"  Test accuracy: {test_acc*100:.2f}%")
+    secuencia = []
+    for frame in frames:
+        p1 = normalizar_persona(frame[0])  # 34 features
+        p2 = normalizar_persona(frame[1])  # 34 features
+        combinado = np.concatenate([p1, p2])  # 68 features
+        secuencia.append(combinado)
 
-# 7. Reporte por clase
-all_preds, all_labels = [], []
-model.eval()
-with torch.no_grad():
-    for X_b, y_b in test_loader:
-        preds = model(X_b.to(DEVICE)).argmax(1).cpu().numpy()
-        all_preds.extend(preds)
-        all_labels.extend(y_b.numpy())
+    return np.array(secuencia, dtype=np.float32)  # (30, 68)
 
-print("\n📋 Reporte por clase:")
-print(classification_report(all_labels, all_preds, target_names=CLASES))
+def procesar_carpeta(nombre, info):
+    carpeta  = BASE / "videos" / nombre / "esqueletos"
+    archivos = list(carpeta.glob("*.skeleton"))
 
-# 8. Guardar modelo final
-torch.save(model.state_dict(), MODELOS / "legion_lstm_v2_final.pth")
-print("✅ Modelo v2 guardado en modelos/legion_lstm_v2_final.pth")
+    if not archivos:
+        print(f"  ⚠ Sin archivos en {nombre}\\esqueletos")
+        return [], []
+
+    print(f"\n{'='*50}")
+    print(f"  {nombre.upper()} [{info['nivel']}] — {len(archivos)} archivos")
+    print(f"{'='*50}")
+
+    X, y   = [], []
+    errores = 0
+
+    for i, archivo in enumerate(archivos, 1):
+        try:
+            frames    = leer_skeleton(archivo)
+            secuencia = normalizar_secuencia(frames)
+            X.append(secuencia)
+            y.append(info["etiqueta"])
+
+            if i % 500 == 0 or i == len(archivos):
+                print(f"  [{i:04d}/{len(archivos)}] procesados...")
+        except Exception as e:
+            errores += 1
+
+    print(f"  ✔ {len(X)} secuencias OK — {errores} errores")
+    return X, y
+
+if __name__ == "__main__":
+    print("🦴 LEGION IA — Dataset 68 features (2 personas x 17 joints x 2 coords)")
+    print("="*50)
+
+    X_total, y_total = [], []
+
+    for nombre, info in CATEGORIAS.items():
+        X, y = procesar_carpeta(nombre, info)
+        X_total.extend(X)
+        y_total.extend(y)
+
+    X_np = np.array(X_total)
+    y_np = np.array(y_total)
+
+    print(f"\n{'='*50}")
+    print(f"  Shape X: {X_np.shape}  ← (muestras, frames, 68 features)")
+    print(f"  Shape y: {y_np.shape}")
+    print(f"  Clase 0 SEGURA:     {np.sum(y_np==0)}")
+    print(f"  Clase 1 PRECAUCION: {np.sum(y_np==1)}")
+    print(f"  Clase 2 PELIGRO:    {np.sum(y_np==2)}")
+    print(f"{'='*50}")
+
+    DATASET.mkdir(parents=True, exist_ok=True)
+    np.save(DATASET / "X_skeleton_v3.npy", X_np)
+    np.save(DATASET / "y_skeleton_v3.npy", y_np)
+
+    print(f"\n✅ Guardado como X_skeleton_v3.npy e y_skeleton_v3.npy")
+    print(f"   Tamaño: {X_np.nbytes/1024/1024:.1f} MB")

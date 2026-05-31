@@ -1,33 +1,56 @@
-import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from collections import deque
-from ultralytics import YOLO
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 from pathlib import Path
 
 # ============================================================
-# LEGION IA v3 — Detección en vivo con LSTM (optimizado CPU)
+# LEGION IA — Entrenamiento LSTM v3 (68 features, 2 personas)
 # ============================================================
 
 BASE    = Path(r"C:\Users\accas\legion-ia")
-DEVICE  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CLASES  = ["SEGURA", "PRECAUCION", "PELIGRO"]
-COLORES = {
-    "SEGURA":     (0, 200, 80),
-    "PRECAUCION": (0, 180, 255),
-    "PELIGRO":    (0, 0, 255),
-}
+DATASET = BASE / "modelos" / "dataset"
+MODELOS = BASE / "modelos"
 
-IDX_CADERA_IZQ = 11
-IDX_CADERA_DER = 12
-IDX_HOMBRO_IZQ = 5
-IDX_HOMBRO_DER = 6
-FRAMES_SEQ     = 30
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CLASES = ["SEGURA", "PRECAUCION", "PELIGRO"]
 
-# ── Modelo LSTM ──────────────────────────────────────────────
+print(f"🖥️  Dispositivo: {DEVICE}")
+
+# 1. Cargar dataset v3
+print("\n📂 Cargando dataset v3...")
+X = np.load(DATASET / "X_skeleton_v3.npy")
+y = np.load(DATASET / "y_skeleton_v3.npy")
+
+print(f"  X: {X.shape}  ← (muestras, 30 frames, 68 features)")
+print(f"  Clase 0 SEGURA:     {np.sum(y==0)}")
+print(f"  Clase 1 PRECAUCION: {np.sum(y==1)}")
+print(f"  Clase 2 PELIGRO:    {np.sum(y==2)}")
+
+# 2. Dividir dataset
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.3, random_state=42, stratify=y)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
+
+print(f"\n📊 División:")
+print(f"  Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+
+# 3. Tensores
+def to_tensor(X, y):
+    return TensorDataset(
+        torch.tensor(X, dtype=torch.float32),
+        torch.tensor(y, dtype=torch.long))
+
+train_loader = DataLoader(to_tensor(X_train, y_train), batch_size=32, shuffle=True)
+val_loader   = DataLoader(to_tensor(X_val,   y_val),   batch_size=32)
+test_loader  = DataLoader(to_tensor(X_test,  y_test),  batch_size=32)
+
+# 4. Modelo LSTM v3 (input_size=68)
 class LegionLSTM(nn.Module):
-    def __init__(self, input_size=34, hidden_size=128,
+    def __init__(self, input_size=68, hidden_size=128,
                  num_layers=2, num_classes=3):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size,
@@ -47,184 +70,82 @@ class LegionLSTM(nn.Module):
         out = self.drop(out)
         return self.fc2(out)
 
-# ── Cargar modelos ───────────────────────────────────────────
-print("Cargando modelos...")
-yolo = YOLO(str(BASE / "yolov8n-pose.pt"))
-lstm = LegionLSTM().to(DEVICE)
-lstm.load_state_dict(torch.load(
-    BASE / "modelos" / "legion_lstm_v2_best.pth",
-    map_location=DEVICE))
-lstm.eval()
-print(f"✔ Modelos cargados — dispositivo: {DEVICE}")
+model     = LegionLSTM().to(DEVICE)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, patience=5, factor=0.5)
 
-# ── Normalización ────────────────────────────────────────────
-def normalizar_keypoints(kpts):
-    cadera = (kpts[IDX_CADERA_IZQ] + kpts[IDX_CADERA_DER]) / 2
-    hombro = (kpts[IDX_HOMBRO_IZQ] + kpts[IDX_HOMBRO_DER]) / 2
-    escala = np.linalg.norm(hombro - cadera) + 1e-6
-    return ((kpts - cadera) / escala).flatten().astype(np.float32)
+print(f"\n🧠 Modelo LSTM v3 — input_size=68 (2 personas)")
+print(f"  Parámetros: {sum(p.numel() for p in model.parameters()):,}")
 
-# ── Buffer por persona ───────────────────────────────────────
-class BufferPersona:
-    def __init__(self):
-        self.frames    = deque(maxlen=FRAMES_SEQ)
-        self.clase     = "..."
-        self.confianza = 0.0
-        self.color     = (150, 150, 150)
+# 5. Entrenamiento
+def evaluar(loader):
+    model.eval()
+    correctos, total, loss_total = 0, 0, 0.0
+    with torch.no_grad():
+        for X_b, y_b in loader:
+            X_b, y_b = X_b.to(DEVICE), y_b.to(DEVICE)
+            out  = model(X_b)
+            loss = criterion(out, y_b)
+            loss_total += loss.item()
+            correctos  += (out.argmax(1) == y_b).sum().item()
+            total      += len(y_b)
+    return loss_total / len(loader), correctos / total
 
-    def agregar(self, kpts_norm):
-        self.frames.append(kpts_norm)
+print("\n🚀 Entrenando...")
+mejor_val_acc = 0.0
+paciencia     = 0
+PACIENCIA_MAX = 10
 
-    def predecir(self, modelo):
-        if len(self.frames) < 10:
-            return
-        seq = list(self.frames)
-        while len(seq) < FRAMES_SEQ:
-            seq.append(seq[-1])
-        tensor = torch.tensor(
-            np.array(seq), dtype=torch.float32
-        ).unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            out   = modelo(tensor)
-            probs = torch.softmax(out, dim=1)[0].cpu().numpy()
-            idx   = np.argmax(probs)
-        self.clase     = CLASES[idx]
-        self.confianza = probs[idx]
-        self.color     = COLORES[self.clase]
+for epoch in range(1, 51):
+    model.train()
+    for X_b, y_b in train_loader:
+        X_b, y_b = X_b.to(DEVICE), y_b.to(DEVICE)
+        optimizer.zero_grad()
+        loss = criterion(model(X_b), y_b)
+        loss.backward()
+        optimizer.step()
 
-buffers = {}
+    train_loss, train_acc = evaluar(train_loader)
+    val_loss,   val_acc   = evaluar(val_loader)
+    scheduler.step(val_loss)
 
-# ── Dibujado ─────────────────────────────────────────────────
-def dibujar_persona(frame, x1, y1, x2, y2, kpts,
-                    escala_x, escala_y, buf, pid):
-    color = buf.color
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    print(f"  Epoch {epoch:02d}/50 — "
+          f"train_acc: {train_acc*100:.1f}% — "
+          f"val_acc: {val_acc*100:.1f}%")
 
-    for idx in [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]:
-        if idx < len(kpts):
-            px = int(kpts[idx][0] * escala_x)
-            py = int(kpts[idx][1] * escala_y)
-            if px > 0 and py > 0:
-                cv2.circle(frame, (px, py), 4, color, -1)
-
-    if len(kpts) > 0:
-        nx = int(kpts[0][0] * escala_x)
-        ny = int(kpts[0][1] * escala_y)
-        if nx > 0 and ny > 0:
-            cv2.circle(frame, (nx, ny), 6, (255, 100, 0), -1)
-
-    etiqueta = f"P{pid}: {buf.clase} {buf.confianza*100:.0f}%"
-    ty = max(y1 - 10, 20)
-    cv2.rectangle(frame, (x1, ty-20),
-                  (x1 + len(etiqueta)*11, ty+5), (0,0,0), -1)
-    cv2.putText(frame, etiqueta, (x1+4, ty),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
-def dibujar_panel(frame, personas, buffers_activos):
-    h, w = frame.shape[:2]
-    cv2.rectangle(frame, (0, 0), (w, 90), (0, 0, 0), -1)
-    cv2.putText(frame, "LEGION IA v3",
-                (20, 35), cv2.FONT_HERSHEY_SIMPLEX,
-                1.0, (200, 200, 200), 2)
-    cv2.putText(frame, f"Personas: {personas}",
-                (20, 65), cv2.FONT_HERSHEY_SIMPLEX,
-                0.65, (150, 150, 150), 1)
-
-    nivel = "SEGURA"
-    for buf in buffers_activos:
-        if buf.clase == "PELIGRO":
-            nivel = "PELIGRO"
+    if val_acc > mejor_val_acc:
+        mejor_val_acc = val_acc
+        torch.save(model.state_dict(),
+                   MODELOS / "legion_lstm_v3_best.pth")
+        paciencia = 0
+    else:
+        paciencia += 1
+        if paciencia >= PACIENCIA_MAX:
+            print(f"\n  Early stopping en epoch {epoch}")
             break
-        elif buf.clase == "PRECAUCION" and nivel != "PELIGRO":
-            nivel = "PRECAUCION"
 
-    cv2.putText(frame, f"ESTADO: {nivel}",
-                (w-320, 45), cv2.FONT_HERSHEY_SIMPLEX,
-                0.9, COLORES[nivel], 2)
-    cv2.rectangle(frame, (0, h-40), (w, h), (0, 0, 0), -1)
-    cv2.putText(frame, "Q: salir  |  R: resetear buffers",
-                (20, h-15), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, (100, 100, 100), 1)
+# 6. Evaluación final
+print(f"\n📈 Mejor val_accuracy: {mejor_val_acc*100:.2f}%")
+model.load_state_dict(torch.load(
+    MODELOS / "legion_lstm_v3_best.pth",
+    map_location=DEVICE))
+_, test_acc = evaluar(test_loader)
+print(f"  Test accuracy: {test_acc*100:.2f}%")
 
-# ── Loop principal ───────────────────────────────────────────
-camara = cv2.VideoCapture(0)
-camara.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-camara.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+# 7. Reporte por clase
+all_preds, all_labels = [], []
+model.eval()
+with torch.no_grad():
+    for X_b, y_b in test_loader:
+        preds = model(X_b.to(DEVICE)).argmax(1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(y_b.numpy())
 
-print("Legion IA v3 iniciado. Q=salir, R=resetear")
-frame_count = 0
+print("\n📋 Reporte por clase:")
+print(classification_report(all_labels, all_preds, target_names=CLASES))
 
-while True:
-    ret, frame = camara.read()
-    if not ret:
-        break
-
-    frame_count += 1
-
-    # Resolución reducida para más velocidad
-    frame_proc = cv2.resize(frame, (416, 320))
-    escala_x   = frame.shape[1] / 416
-    escala_y   = frame.shape[0] / 320
-
-    resultados = yolo(frame_proc, conf=0.5, verbose=False)
-
-    ids_frame       = set()
-    buffers_activos = []
-
-    for resultado in resultados:
-        if resultado.keypoints is None:
-            continue
-
-        for i, caja in enumerate(resultado.boxes):
-            x1, y1, x2, y2 = map(int, caja.xyxy[0])
-            if (x2-x1) < 50 or (y2-y1) < 80:
-                continue
-
-            cx  = int((x1+x2)/2 * escala_x)
-            cy  = int((y1+y2)/2 * escala_y)
-            pid = f"{cx//80}_{cy//80}"
-            ids_frame.add(pid)
-
-            if pid not in buffers:
-                buffers[pid] = BufferPersona()
-
-            buf  = buffers[pid]
-            kpts = resultado.keypoints.xy[i].cpu().numpy()
-
-            if len(kpts) == 17:
-                kpts_norm = normalizar_keypoints(kpts)
-                buf.agregar(kpts_norm)
-
-                # Predecir cada 8 frames para más fluidez
-                if frame_count % 8 == 0:
-                    buf.predecir(lstm)
-
-            buffers_activos.append(buf)
-
-            x1s = int(x1 * escala_x)
-            y1s = int(y1 * escala_y)
-            x2s = int(x2 * escala_x)
-            y2s = int(y2 * escala_y)
-
-            dibujar_persona(frame, x1s, y1s, x2s, y2s,
-                           kpts, escala_x, escala_y, buf,
-                           list(ids_frame).index(pid)+1)
-
-    for pid in list(buffers.keys()):
-        if pid not in ids_frame:
-            del buffers[pid]
-
-    dibujar_panel(frame, len(ids_frame), buffers_activos)
-
-    cv2.imshow("Legion IA v3 — Deteccion en vivo", frame)
-
-    tecla = cv2.waitKey(1) & 0xFF
-    if tecla == ord('q'):
-        break
-    elif tecla == ord('r'):
-        buffers.clear()
-        print("Buffers reseteados")
-
-camara.release()
-cv2.destroyAllWindows()
-print("Legion IA v3 cerrado.")
+# 8. Guardar modelo final
+torch.save(model.state_dict(), MODELOS / "legion_lstm_v3_final.pth")
+print("✅ Modelo v3 guardado en modelos/legion_lstm_v3_final.pth")
