@@ -1,8 +1,27 @@
 import cv2
 from pathlib import Path
 
+# ============================================================
+# LEGION IA — Extractor de frames v3 (peleas + neutros)
+# ============================================================
+
 BASE = Path(r"C:\Users\accas\legion-ia\videos")
 FORMATOS = {".mp4", ".webm", ".avi", ".mov", ".mpeg"}
+
+CONFIG = {
+    "peleas": {
+        "origen":     BASE / "peleas",
+        "destino":    BASE / "peleas" / "frames",
+        "fps":        5,
+        "max_frames": 150,
+    },
+    "neutros": {
+        "origen":     BASE / "neutros",
+        "destino":    BASE / "neutros" / "frames",
+        "fps":        5,
+        "max_frames": 150,
+    },
+}
 
 def extraer_frames(video_path, destino, fps_objetivo=5, max_frames=150):
     cap = cv2.VideoCapture(str(video_path))
@@ -28,9 +47,9 @@ def extraer_frames(video_path, destino, fps_objetivo=5, max_frames=150):
     cap.release()
     return guardados
 
-if __name__ == "__main__":
-    origen  = BASE / "peleas"
-    destino = BASE / "peleas" / "frames"
+def procesar_categoria(nombre, config):
+    origen  = config["origen"]
+    destino = config["destino"]
     destino.mkdir(parents=True, exist_ok=True)
 
     videos = [f for f in origen.rglob("*")
@@ -38,13 +57,33 @@ if __name__ == "__main__":
               and f.suffix.lower() in FORMATOS
               and "frames" not in str(f)]
 
-    print(f"🎬 Videos encontrados: {len(videos)}")
+    if not videos:
+        print(f"\n  ⚠ Sin videos en {nombre}")
+        return 0
+
+    print(f"\n{'='*50}")
+    print(f"  {nombre.upper()} — {len(videos)} videos")
+    print(f"{'='*50}")
 
     total = 0
     for i, video in enumerate(videos, 1):
-        frames = extraer_frames(video, destino)
+        frames = extraer_frames(video, destino,
+                               config["fps"], config["max_frames"])
         total += frames
         if i % 100 == 0 or i == len(videos):
             print(f"  [{i:04d}/{len(videos)}] — {total:,} frames")
 
-    print(f"\n✅ COMPLETO — {total:,} frames totales")
+    print(f"\n  ✔ Total: {total:,} frames de {nombre}")
+    return total
+
+if __name__ == "__main__":
+    print("🎬 LEGION IA — Extractor de frames v3")
+    print("="*50)
+
+    total_global = 0
+    for nombre, config in CONFIG.items():
+        total_global += procesar_categoria(nombre, config)
+
+    print(f"\n{'='*50}")
+    print(f"✅ COMPLETO — {total_global:,} frames totales")
+    print(f"{'='*50}")
