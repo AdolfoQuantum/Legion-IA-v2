@@ -2,17 +2,43 @@ import numpy as np
 from pathlib import Path
 
 # ============================================================
-# LEGION IA — Dataset con 17 joints x 2 coords x 2 personas
-# = 68 features (interaccion entre dos personas)
+# LEGION IA — Dataset con 4 clases (VERDE/AZUL/AMARILLO/ROJO)
 # ============================================================
 
 BASE    = Path(r"C:\Users\accas\legion-ia")
 DATASET = BASE / "modelos" / "dataset"
 
+# ── Nueva taxonomía de 4 clases ─────────────────────────────
+# Clase 0 = VERDE    → acciones completamente seguras
+# Clase 1 = AZUL     → contacto amistoso o situación inusual
+# Clase 2 = AMARILLO → empujones, caídas, forcejeo leve
+# Clase 3 = ROJO     → peleas activas, golpes
+
 CATEGORIAS = {
-    "agresiones": {"etiqueta": 2, "nivel": "PELIGRO"},
-    "neutros":    {"etiqueta": 1, "nivel": "PRECAUCION"},
-    "saludos":    {"etiqueta": 0, "nivel": "SEGURA"},
+    # VERDE — acciones completamente seguras
+    "saludos_verde": {
+        "carpeta":  "saludos",
+        "etiqueta": 0,
+        "clases_ntu": ["A058", "A059", "A060", "A112", "A119"],
+    },
+    # AZUL — contacto amistoso o situación inusual
+    "saludos_azul": {
+        "carpeta":  "saludos",
+        "etiqueta": 1,
+        "clases_ntu": ["A055", "A053", "A002"],
+    },
+    # AMARILLO — empujones, caídas, forcejeo leve
+    "neutros_amarillo": {
+        "carpeta":  "neutros",
+        "etiqueta": 2,
+        "clases_ntu": ["A052", "A043", "A011", "A108"],
+    },
+    # ROJO — peleas activas, golpes
+    "agresiones_rojo": {
+        "carpeta":  "agresiones",
+        "etiqueta": 3,
+        "clases_ntu": ["A050", "A051"],
+    },
 }
 
 # Mapeo NTU (25 joints) → YOLO (17 joints)
@@ -53,7 +79,6 @@ def leer_skeleton(ruta):
                     dtype=np.float32)
                 personas_frame.append(joints_17)
 
-        # Siempre 2 personas — rellenar con ceros si falta
         while len(personas_frame) < 2:
             personas_frame.append(np.zeros((NUM_JOINTS, 2), dtype=np.float32))
 
@@ -77,37 +102,55 @@ def normalizar_secuencia(frames):
 
     secuencia = []
     for frame in frames:
-        p1 = normalizar_persona(frame[0])  # 34 features
-        p2 = normalizar_persona(frame[1])  # 34 features
+        p1 = normalizar_persona(frame[0])
+        p2 = normalizar_persona(frame[1])
         combinado = np.concatenate([p1, p2])  # 68 features
         secuencia.append(combinado)
 
     return np.array(secuencia, dtype=np.float32)  # (30, 68)
 
-def procesar_carpeta(nombre, info):
-    carpeta  = BASE / "videos" / nombre / "esqueletos"
-    archivos = list(carpeta.glob("*.skeleton"))
+def extraer_codigo_accion(nombre_archivo):
+    """Extrae el código de acción del nombre del archivo NTU"""
+    # Formato: S001C001P001R001A050.skeleton
+    nombre = nombre_archivo.stem.upper()
+    try:
+        idx_a = nombre.index('A')
+        return nombre[idx_a:idx_a+4]  # Ej: A050
+    except:
+        return None
 
-    if not archivos:
-        print(f"  ⚠ Sin archivos en {nombre}\\esqueletos")
+def procesar_categoria(nombre, config):
+    carpeta  = BASE / "videos" / config["carpeta"] / "esqueletos"
+    archivos = list(carpeta.glob("*.skeleton"))
+    clases_validas = config["clases_ntu"]
+
+    # Filtrar solo los archivos de las clases NTU correspondientes
+    archivos_filtrados = [
+        f for f in archivos
+        if extraer_codigo_accion(f) in clases_validas
+    ]
+
+    if not archivos_filtrados:
+        print(f"  ⚠ Sin archivos para {nombre} — clases: {clases_validas}")
         return [], []
 
-    print(f"\n{'='*50}")
-    print(f"  {nombre.upper()} [{info['nivel']}] — {len(archivos)} archivos")
-    print(f"{'='*50}")
+    print(f"\n{'='*55}")
+    print(f"  {nombre.upper()} — {len(archivos_filtrados)} archivos")
+    print(f"  Clases: {clases_validas}")
+    print(f"{'='*55}")
 
-    X, y   = [], []
+    X, y    = [], []
     errores = 0
 
-    for i, archivo in enumerate(archivos, 1):
+    for i, archivo in enumerate(archivos_filtrados, 1):
         try:
             frames    = leer_skeleton(archivo)
             secuencia = normalizar_secuencia(frames)
             X.append(secuencia)
-            y.append(info["etiqueta"])
+            y.append(config["etiqueta"])
 
-            if i % 500 == 0 or i == len(archivos):
-                print(f"  [{i:04d}/{len(archivos)}] procesados...")
+            if i % 300 == 0 or i == len(archivos_filtrados):
+                print(f"  [{i:04d}/{len(archivos_filtrados)}] procesados...")
         except Exception as e:
             errores += 1
 
@@ -115,30 +158,31 @@ def procesar_carpeta(nombre, info):
     return X, y
 
 if __name__ == "__main__":
-    print("🦴 LEGION IA — Dataset 68 features (2 personas x 17 joints x 2 coords)")
-    print("="*50)
+    print("🦴 LEGION IA — Dataset 4 clases (VERDE/AZUL/AMARILLO/ROJO)")
+    print("="*55)
 
     X_total, y_total = [], []
 
-    for nombre, info in CATEGORIAS.items():
-        X, y = procesar_carpeta(nombre, info)
+    for nombre, config in CATEGORIAS.items():
+        X, y = procesar_categoria(nombre, config)
         X_total.extend(X)
         y_total.extend(y)
 
     X_np = np.array(X_total)
     y_np = np.array(y_total)
 
-    print(f"\n{'='*50}")
-    print(f"  Shape X: {X_np.shape}  ← (muestras, frames, 68 features)")
-    print(f"  Shape y: {y_np.shape}")
-    print(f"  Clase 0 SEGURA:     {np.sum(y_np==0)}")
-    print(f"  Clase 1 PRECAUCION: {np.sum(y_np==1)}")
-    print(f"  Clase 2 PELIGRO:    {np.sum(y_np==2)}")
-    print(f"{'='*50}")
+    print(f"\n{'='*55}")
+    print(f"  Shape X: {X_np.shape}")
+    print(f"  Clase 0 VERDE:    {np.sum(y_np==0)} muestras")
+    print(f"  Clase 1 AZUL:     {np.sum(y_np==1)} muestras")
+    print(f"  Clase 2 AMARILLO: {np.sum(y_np==2)} muestras")
+    print(f"  Clase 3 ROJO:     {np.sum(y_np==2)} muestras")
+    print(f"  TOTAL:            {len(y_np)} muestras")
+    print(f"{'='*55}")
 
     DATASET.mkdir(parents=True, exist_ok=True)
-    np.save(DATASET / "X_skeleton_v3.npy", X_np)
-    np.save(DATASET / "y_skeleton_v3.npy", y_np)
+    np.save(DATASET / "X_skeleton_v4.npy", X_np)
+    np.save(DATASET / "y_skeleton_v4.npy", y_np)
 
-    print(f"\n✅ Guardado como X_skeleton_v3.npy e y_skeleton_v3.npy")
+    print(f"\n✅ Guardado como X_skeleton_v4.npy e y_skeleton_v4.npy")
     print(f"   Tamaño: {X_np.nbytes/1024/1024:.1f} MB")

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from collections import deque
 from threading import Thread, Lock
+from datetime import datetime
 from ultralytics import YOLO
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy)
@@ -12,33 +13,47 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap
 
 # ============================================================
-# LEGION IA Vision v2 — Monitor multicámara con LSTM
+# LEGION IA Vision v3 — Monitor multicámara 4 clases
 # ============================================================
 
 RUTA_LOGO  = r"C:\Users\accas\legion-ia\logo_legion.PNG"
 RUTA_YOLO  = r"C:\Users\accas\legion-ia\yolov8n-pose.pt"
-RUTA_LSTM  = r"C:\Users\accas\legion-ia\modelos\legion_lstm_v3_best.pth"
+RUTA_LSTM  = r"C:\Users\accas\legion-ia\modelos\legion_lstm_v4_best.pth"
 DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 FRAMES_SEQ = 30
 
-NIVELES = ["NORMAL", "EXTRANO", "PRECAUCION", "PELIGRO"]
+UMBRALES = {
+    "VERDE":    0.70,
+    "AZUL":     0.75,
+    "AMARILLO": 0.80,
+    "ROJO":     0.85,
+}
 
 COLORES = {
-    "NORMAL":     {"border": "#639922", "bg": "#0d1f0d", "text": "#639922"},
-    "EXTRANO":    {"border": "#378ADD", "bg": "#0d1420", "text": "#378ADD"},
-    "PRECAUCION": {"border": "#EF9F27", "bg": "#1a1400", "text": "#EF9F27"},
-    "PELIGRO":    {"border": "#E24B4A", "bg": "#1a0000", "text": "#E24B4A"},
+    "VERDE":    {"border": "#639922", "bg": "#0d1f0d", "text": "#639922"},
+    "AZUL":     {"border": "#378ADD", "bg": "#0d1420", "text": "#378ADD"},
+    "AMARILLO": {"border": "#EF9F27", "bg": "#1a1400", "text": "#EF9F27"},
+    "ROJO":     {"border": "#E24B4A", "bg": "#1a0000", "text": "#E24B4A"},
 }
+
+COLORES_CV = {
+    "VERDE":    (57,  200, 80),
+    "AZUL":     (221, 138, 55),
+    "AMARILLO": (39,  180, 255),
+    "ROJO":     (74,  75,  226),
+}
+
+PRIORIDAD = ["VERDE", "AZUL", "AMARILLO", "ROJO"]
 
 IDX_CADERA_IZQ = 11
 IDX_CADERA_DER = 12
 IDX_HOMBRO_IZQ = 5
 IDX_HOMBRO_DER = 6
 
-# ── Modelo LSTM ──────────────────────────────────────────────
+# ── Modelo LSTM v4 ───────────────────────────────────────────
 class LegionLSTM(nn.Module):
     def __init__(self, input_size=68, hidden_size=128,
-                 num_layers=2, num_classes=3):
+                 num_layers=2, num_classes=4):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size,
                             num_layers=num_layers,
@@ -57,23 +72,44 @@ class LegionLSTM(nn.Module):
         out = self.drop(out)
         return self.fc2(out)
 
-# ── Cargar modelos globales ──────────────────────────────────
+# ── Cargar modelos ───────────────────────────────────────────
 print("Cargando modelos...")
-yolo_model = YOLO(RUTA_YOLO)
+yolo_model  = YOLO(RUTA_YOLO)
 lstm_model  = LegionLSTM().to(DEVICE)
 lstm_model.load_state_dict(torch.load(RUTA_LSTM, map_location=DEVICE))
 lstm_model.eval()
 modelo_lock = Lock()
-print(f"✔ Modelos cargados — {DEVICE}")
+print(f"Modelos cargados -- {DEVICE}")
 
-# ── Normalización ────────────────────────────────────────────
+# ── Utilidades ───────────────────────────────────────────────
 def normalizar_keypoints(kpts):
     cadera = (kpts[IDX_CADERA_IZQ] + kpts[IDX_CADERA_DER]) / 2
     hombro = (kpts[IDX_HOMBRO_IZQ] + kpts[IDX_HOMBRO_DER]) / 2
     escala = np.linalg.norm(hombro - cadera) + 1e-6
     return ((kpts - cadera) / escala).flatten().astype(np.float32)
 
-# ── Logo ─────────────────────────────────────────────────────
+def detectar_caida(boxes):
+    for i, caja in enumerate(boxes):
+        if i >= 2:
+            break
+        x1, y1, x2, y2 = map(int, caja.xyxy[0])
+        ancho = x2 - x1
+        alto  = y2 - y1
+        ratio = alto / (ancho + 1e-6)
+        if ratio < 0.5:
+            return True
+    return False
+
+def aplicar_umbrales(probs):
+    mapa  = {0: "VERDE", 1: "AZUL", 2: "AMARILLO", 3: "ROJO"}
+    idx   = np.argmax(probs)
+    conf  = probs[idx]
+    nivel = mapa[idx]
+    while nivel != "VERDE" and conf < UMBRALES[nivel]:
+        idx_actual = PRIORIDAD.index(nivel)
+        nivel = PRIORIDAD[idx_actual - 1]
+    return nivel, conf
+
 def crear_logo_coloreado(ruta, color, size=55):
     img_cv = cv2.imread(ruta, cv2.IMREAD_UNCHANGED)
     if img_cv is None:
@@ -110,28 +146,27 @@ def detectar_camaras(max_check=10):
     return camaras
 
 def get_nivel_inicial(idx, total):
-    if total == 1: return "NORMAL"
+    if total == 1: return "VERDE"
     p = idx / total
-    if p < 0.25:   return "NORMAL"
-    if p < 0.50:   return "EXTRANO"
-    if p < 0.75:   return "PRECAUCION"
-    return "PELIGRO"
+    if p < 0.25:   return "VERDE"
+    if p < 0.50:   return "AZUL"
+    if p < 0.75:   return "AMARILLO"
+    return "ROJO"
 
-# ── Analizador por cámara (hilo) ─────────────────────────────
+# ── Analizador por cámara ────────────────────────────────────
 class AnalizadorCamara(QObject):
     nivel_actualizado = pyqtSignal(int, str, float, object)
 
     def __init__(self, cam_id, cam_idx):
         super().__init__()
-        self.cam_id   = cam_id
-        self.cam_idx  = cam_idx
-        self.activo   = True
-        self.buffer   = deque(maxlen=FRAMES_SEQ)
-        self.nivel    = "NORMAL"
+        self.cam_id       = cam_id
+        self.cam_idx      = cam_idx
+        self.activo       = True
+        self.buffer       = deque(maxlen=FRAMES_SEQ)
         self.frame_actual = None
-        self.lock     = Lock()
-        self.cap      = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
-        self.hilo     = Thread(target=self._analizar, daemon=True)
+        self.lock         = Lock()
+        self.cap          = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+        self.hilo         = Thread(target=self._analizar, daemon=True)
         self.hilo.start()
 
     def _analizar(self):
@@ -147,7 +182,6 @@ class AnalizadorCamara(QObject):
             with self.lock:
                 self.frame_actual = frame.copy()
 
-            # Analizar cada 10 frames
             if frame_count % 10 != 0:
                 continue
 
@@ -162,25 +196,17 @@ class AnalizadorCamara(QObject):
                     ultimo_resultado = resultado
                     if resultado.keypoints is None:
                         continue
-                    for i, caja in enumerate(resultado.boxes):
-                        x1, y1, x2, y2 = map(int, caja.xyxy[0])
-                        if (x2-x1) < 50 or (y2-y1) < 80:
-                            continue
-                        kpts = resultado.keypoints.xy[i].cpu().numpy()
-                        kpts_todas = []
-                        for j, c in enumerate(resultado.boxes):
-                            if j >= 2:
-                                break
-                            k = resultado.keypoints.xy[j].cpu().numpy()
-                            if len(k) == 17:
-                                kpts_todas.append(normalizar_keypoints(k))
 
-                # Rellenar segunda persona con ceros si solo hay una
-                        while len(kpts_todas) < 2:
-                            kpts_todas.append(np.zeros(34, dtype=np.float32))
+                    kpts_todas = []
+                    for j in range(min(2, len(resultado.boxes))):
+                        k = resultado.keypoints.xy[j].cpu().numpy()
+                        if len(k) == 17:
+                            kpts_todas.append(normalizar_keypoints(k))
 
-                        kpts_combinado = np.concatenate(kpts_todas)  # 68 features
-                        self.buffer.append(kpts_combinado)
+                    while len(kpts_todas) < 2:
+                        kpts_todas.append(np.zeros(34, dtype=np.float32))
+
+                    self.buffer.append(np.concatenate(kpts_todas))
 
                 if len(self.buffer) >= 10:
                     seq = list(self.buffer)
@@ -193,85 +219,81 @@ class AnalizadorCamara(QObject):
                     with torch.no_grad():
                         out   = lstm_model(tensor)
                         probs = torch.softmax(out, dim=1)[0].cpu().numpy()
-                        idx   = np.argmax(probs)
 
-                    # Mapear índice LSTM a nivel
-                    mapa = {0: "NORMAL", 1: "PRECAUCION", 2: "PELIGRO"}
-                    idx_pred = idx
-                    conf = probs[idx]
+                    nivel, conf = aplicar_umbrales(probs)
 
-                    # Solo clasificar PELIGRO si confianza > 85%
-                    # Si no, bajar al siguiente nivel
-                    if idx_pred == 2 and conf < 0.85:
-                        idx_pred = 1  # bajar a PRECAUCION
-                    elif idx_pred == 1 and conf < 0.60:
-                        idx_pred = 0  # bajar a NORMAL
+                    if ultimo_resultado is not None:
+                        if detectar_caida(ultimo_resultado.boxes):
+                            if PRIORIDAD.index(nivel) < PRIORIDAD.index("AMARILLO"):
+                                nivel = "AMARILLO"
+                                conf  = 0.90
 
-                    nivel = mapa.get(idx_pred, "NORMAL")
-
-                    # Obtener frame con anotaciones
-                    frame_anot = self._anotar_frame(frame, ultimo_resultado, nivel, conf)
+                    frame_anot = self._anotar_frame(
+                        frame, ultimo_resultado, nivel, conf)
                     self.nivel_actualizado.emit(
                         self.cam_id, nivel, conf, frame_anot)
 
-            except Exception as e:
+            except Exception:
                 pass
 
     def _anotar_frame(self, frame, resultado_yolo, nivel, conf):
-        color_map = {
-            "NORMAL":     (57,  200, 80),
-            "EXTRANO":    (221, 138, 55),
-            "PRECAUCION": (39,  180, 255),
-            "PELIGRO":    (74,  75,  226),
-        }
-        color = color_map.get(nivel, (100, 100, 100))
+        color = COLORES_CV.get(nivel, (100, 100, 100))
         h, w  = frame.shape[:2]
 
-        # Dibujar recuadro y etiqueta por cada persona
-        for i, caja in enumerate(resultado_yolo.boxes):
-            if i >= 2:
-                break
-            x1, y1, x2, y2 = map(int, caja.xyxy[0])
-            x1 = int(x1 * frame.shape[1] / 416)
-            y1 = int(y1 * frame.shape[0] / 320)
-            x2 = int(x2 * frame.shape[1] / 416)
-            y2 = int(y2 * frame.shape[0] / 320)
+        if resultado_yolo is not None:
+            for i, caja in enumerate(resultado_yolo.boxes):
+                if i >= 2:
+                    break
+                x1, y1, x2, y2 = map(int, caja.xyxy[0])
+                sx = w / 416
+                sy = h / 320
+                x1 = int(x1*sx); y1 = int(y1*sy)
+                x2 = int(x2*sx); y2 = int(y2*sy)
 
-            # Recuadro persona
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                ancho = x2 - x1
+                alto  = y2 - y1
+                caida = (alto / (ancho + 1e-6)) < 0.5
 
-            # Etiqueta sobre el recuadro
-            etiqueta = f"P{i+1}: {nivel} {conf*100:.0f}%"
-            ty = max(y1 - 8, 20)
-            cv2.rectangle(frame, (x1, ty-18),
-                          (x1 + len(etiqueta)*9, ty+4),
-                          (0, 0, 0), -1)
-            cv2.putText(frame, etiqueta, (x1+3, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, color, 1)
+                color_p  = COLORES_CV["AMARILLO"] if caida else color
+                etiqueta = f"P{i+1}: CAIDA" if caida else \
+                           f"P{i+1}: {nivel} {conf*100:.0f}%"
 
-            # Puntos keypoints en brazos
-            if resultado_yolo.keypoints is not None and i < len(resultado_yolo.keypoints.xy):
-                kpts = resultado_yolo.keypoints.xy[i].cpu().numpy()
-                sx = frame.shape[1] / 416
-                sy = frame.shape[0] / 320
-                for idx in [5, 6, 7, 8, 9, 10]:
-                    if idx < len(kpts):
-                        px = int(kpts[idx][0] * sx)
-                        py = int(kpts[idx][1] * sy)
-                        if px > 0 and py > 0:
-                            cv2.circle(frame, (px, py), 4, color, -1)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color_p, 2)
+                ty = max(y1 - 8, 20)
+                cv2.rectangle(frame, (x1, ty-18),
+                              (x1 + len(etiqueta)*9, ty+4),
+                              (0, 0, 0), -1)
+                cv2.putText(frame, etiqueta, (x1+3, ty),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, color_p, 1)
 
-        # Panel superior
-        cv2.rectangle(frame, (0, 0), (w, 32), (0, 0, 0), -1)
-        cv2.putText(frame, f"LEGION IA — {nivel} {conf*100:.0f}%",
+                if resultado_yolo.keypoints is not None and \
+                   i < len(resultado_yolo.keypoints.xy):
+                    kpts = resultado_yolo.keypoints.xy[i].cpu().numpy()
+                    for idx in [5, 6, 7, 8, 9, 10]:
+                        if idx < len(kpts):
+                            px = int(kpts[idx][0] * sx)
+                            py = int(kpts[idx][1] * sy)
+                            if px > 0 and py > 0:
+                                cv2.circle(frame, (px, py), 4, color_p, -1)
+
+        # Panel superior sin caracteres especiales
+        cv2.rectangle(frame, (0, 0), (w, 36), (0, 0, 0), -1)
+        texto_nivel = f"LEGION IA  {nivel}  {conf*100:.0f}%"
+        ahora = datetime.now().strftime("%Y/%m/%d  %H:%M:%S")
+        cv2.putText(frame, texto_nivel,
                     (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 2)
+                    0.65, color, 2)
+        cv2.putText(frame, ahora,
+                    (w - 210, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50, (180, 180, 180), 1)
 
         return frame
+
     def get_frame(self):
         with self.lock:
-            return self.frame_actual.copy() if self.frame_actual is not None else None
+            return self.frame_actual.copy() \
+                if self.frame_actual is not None else None
 
     def detener(self):
         self.activo = False
@@ -290,10 +312,6 @@ class CamaraWidget(QWidget):
         self.setFixedSize(70, 55)
         self.setCursor(Qt.PointingHandCursor)
         self._setup_ui()
-
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._actualizar_frame)
-        self.timer.start(150)
 
     def _setup_ui(self):
         self.setStyleSheet(f"""
@@ -315,7 +333,8 @@ class CamaraWidget(QWidget):
         self.lbl_nombre = QLabel(f"CAM {self.cam_id:02d}")
         self.lbl_nombre.setAlignment(Qt.AlignCenter)
         self.lbl_nombre.setStyleSheet(
-            f"color:{self.color['text']}; font-size:8px; font-weight:bold; border:none; background:transparent;")
+            f"color:{self.color['text']}; font-size:8px; "
+            f"font-weight:bold; border:none; background:transparent;")
 
         layout.addWidget(self.lbl_video)
         layout.addWidget(self.lbl_nombre)
@@ -333,13 +352,10 @@ class CamaraWidget(QWidget):
             }}
         """)
         self.lbl_nombre.setStyleSheet(
-            f"color:{self.color['text']}; font-size:8px; font-weight:bold; border:none; background:transparent;")
-
+            f"color:{self.color['text']}; font-size:8px; "
+            f"font-weight:bold; border:none; background:transparent;")
         if frame is not None:
             self._mostrar_frame(frame)
-
-    def _actualizar_frame(self):
-        pass
 
     def _mostrar_frame(self, frame):
         try:
@@ -358,7 +374,7 @@ class CamaraWidget(QWidget):
 class PrincipalWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.border_color = "#639922"
+        self.border_color  = "#639922"
         self.cam_id_actual = 1
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._setup_ui()
@@ -380,19 +396,20 @@ class PrincipalWidget(QWidget):
         self.lbl_video.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.lbl_info = QLabel("● CAM 01 — NORMAL")
+        self.lbl_info = QLabel("CAM 01  VERDE")
         self.lbl_info.setAlignment(Qt.AlignCenter)
         self.lbl_info.setFixedHeight(22)
         self.lbl_info.setStyleSheet(
-            f"color:{self.border_color}; font-size:12px; font-weight:bold; border:none; background:transparent;")
+            f"color:{self.border_color}; font-size:12px; "
+            f"font-weight:bold; border:none; background:transparent;")
 
         layout.addWidget(self.lbl_video)
         layout.addWidget(self.lbl_info)
 
     def actualizar(self, cam_id, nivel, conf, frame):
-        self.cam_id_actual = cam_id
         color = COLORES[nivel]['border']
-        self.border_color = color
+        self.border_color  = color
+        self.cam_id_actual = cam_id
         self.setStyleSheet(f"""
             QWidget {{
                 background-color: #111111;
@@ -401,9 +418,10 @@ class PrincipalWidget(QWidget):
             }}
         """)
         self.lbl_info.setText(
-            f"● CAM {cam_id:02d} — {nivel} {conf*100:.0f}%")
+            f"CAM {cam_id:02d}  {nivel}  {conf*100:.0f}%")
         self.lbl_info.setStyleSheet(
-            f"color:{color}; font-size:12px; font-weight:bold; border:none; background:transparent;")
+            f"color:{color}; font-size:12px; "
+            f"font-weight:bold; border:none; background:transparent;")
 
         if frame is not None:
             try:
@@ -413,14 +431,15 @@ class PrincipalWidget(QWidget):
                     f = cv2.resize(frame, (w, h))
                     f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
                     fh, fw, ch = f.shape
-                    img = QImage(f.data, fw, fh, ch*fw, QImage.Format_RGB888)
+                    img = QImage(f.data, fw, fh, ch*fw,
+                                 QImage.Format_RGB888)
                     self.lbl_video.setPixmap(QPixmap.fromImage(img))
             except:
                 pass
 
     def seleccionar_camara(self, cam_id, color):
         self.cam_id_actual = cam_id
-        self.border_color = color
+        self.border_color  = color
         self.setStyleSheet(f"""
             QWidget {{
                 background-color: #111111;
@@ -429,16 +448,17 @@ class PrincipalWidget(QWidget):
             }}
         """)
         self.lbl_info.setStyleSheet(
-            f"color:{color}; font-size:12px; font-weight:bold; border:none; background:transparent;")
+            f"color:{color}; font-size:12px; "
+            f"font-weight:bold; border:none; background:transparent;")
 
-# ── Logo palpitante ──────────────────────────────────────────
+# ── Logo con 4 colores ───────────────────────────────────────
 class LogoWidget(QWidget):
     clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.pulso     = True
-        self.en_alerta = False
+        self.pulso        = True
+        self.nivel_maximo = "VERDE"
         self.setFixedHeight(70)
         self.setCursor(Qt.PointingHandCursor)
         self._setup_ui()
@@ -461,9 +481,10 @@ class LogoWidget(QWidget):
             self.logo_lbl.setPixmap(pixmap)
             self.tiene_imagen = True
         else:
-            self.logo_lbl.setText("⬡ LEGION")
+            self.logo_lbl.setText("LEGION")
             self.logo_lbl.setStyleSheet(
-                "color:#639922; font-size:20px; font-weight:bold; border:none; background:transparent;")
+                "color:#639922; font-size:20px; font-weight:bold; "
+                "border:none; background:transparent;")
             self.tiene_imagen = False
 
         self.sub_lbl = QLabel("Presiona para ver mayor alerta")
@@ -474,28 +495,30 @@ class LogoWidget(QWidget):
         layout.addWidget(self.logo_lbl)
         layout.addWidget(self.sub_lbl)
 
-    def set_alerta(self, activa):
-        self.en_alerta = activa
+    def set_nivel_maximo(self, nivel):
+        self.nivel_maximo = nivel
 
     def _pulsar(self):
-        if not self.en_alerta:
-            color = "#639922"
-            self._aplicar_color(color)
-            return
-        self.pulso = not self.pulso
-        color = "#E24B4A" if self.pulso else "#400000"
-        self._aplicar_color(color)
+        color_base = COLORES[self.nivel_maximo]['border']
+        pulsa = self.nivel_maximo in ["AMARILLO", "ROJO"]
 
-    def _aplicar_color(self, color):
+        if pulsa:
+            self.pulso = not self.pulso
+            color = color_base if self.pulso else "#0a0a0f"
+        else:
+            color = color_base
+
         if self.tiene_imagen:
             pixmap = crear_logo_coloreado(RUTA_LOGO, color)
             if pixmap:
                 self.logo_lbl.setPixmap(pixmap)
         else:
             self.logo_lbl.setStyleSheet(
-                f"color:{color}; font-size:20px; font-weight:bold; border:none; background:transparent;")
+                f"color:{color}; font-size:20px; font-weight:bold; "
+                "border:none; background:transparent;")
         self.sub_lbl.setStyleSheet(
-            f"color:{color}; font-size:9px; border:none; background:transparent;")
+            f"color:{color}; font-size:9px; "
+            "border:none; background:transparent;")
 
     def mousePressEvent(self, event):
         self.clicked.emit()
@@ -504,7 +527,7 @@ class LogoWidget(QWidget):
 class LegionMonitor(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Legion — IA Vision")
+        self.setWindowTitle("Legion  IA Vision")
         self.setStyleSheet("background-color: #0a0a0f;")
         self.resize(960, 640)
 
@@ -513,10 +536,10 @@ class LegionMonitor(QMainWindow):
         self.analizadores     = {}
         self.niveles_actuales = {}
 
-        print("Detectando cámaras...")
+        print("Detectando camaras...")
         self.indices_camaras = detectar_camaras()
         self.num_camaras     = len(self.indices_camaras)
-        print(f"Cámaras: {self.num_camaras} → {self.indices_camaras}")
+        print(f"Camaras: {self.num_camaras} -> {self.indices_camaras}")
 
         self._setup_ui()
         self._iniciar_analizadores()
@@ -528,23 +551,21 @@ class LegionMonitor(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(6)
 
-        # Header
         header = QHBoxLayout()
-        titulo = QLabel("Legion — IA Vision")
+        titulo = QLabel("Legion  IA Vision")
         titulo.setStyleSheet(
             "color:#e0e0e0; font-size:14px; font-weight:bold;")
         n = self.num_camaras
-        self.lbl_estado = QLabel(f"● {n} cámara{'s' if n>1 else ''} activa{'s' if n>1 else ''}")
+        self.lbl_estado = QLabel(
+            f"  {n} camara{'s' if n>1 else ''} activa{'s' if n>1 else ''}")
         self.lbl_estado.setStyleSheet("color:#639922; font-size:11px;")
         header.addWidget(titulo)
         header.addStretch()
         header.addWidget(self.lbl_estado)
         main_layout.addLayout(header)
 
-        n = self.num_camaras
-
         if n == 0:
-            lbl = QLabel("No se detectaron cámaras")
+            lbl = QLabel("No se detectaron camaras")
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setStyleSheet("color:#555; font-size:16px;")
             main_layout.addWidget(lbl)
@@ -563,7 +584,6 @@ class LegionMonitor(QMainWindow):
             top_niveles   = niveles_ini[left_count:left_count+top_count]
             right_niveles = niveles_ini[left_count+top_count:]
 
-            # Fila superior
             top_row = QHBoxLayout()
             top_row.setSpacing(3)
             esp_izq = QWidget()
@@ -581,7 +601,6 @@ class LegionMonitor(QMainWindow):
             top_row.addWidget(esp_der)
             main_layout.addLayout(top_row)
 
-            # Fila media
             mid_row = QHBoxLayout()
             mid_row.setSpacing(3)
 
@@ -618,33 +637,32 @@ class LegionMonitor(QMainWindow):
 
             main_layout.addLayout(mid_row)
 
-        # Logo
         self.logo = LogoWidget()
         self.logo.clicked.connect(self.on_logo_click)
         main_layout.addWidget(self.logo, alignment=Qt.AlignHCenter)
 
-        # Barra inferior
         barra = QHBoxLayout()
-        info = QLabel(f"Legion IA Vision — {n} cámara{'s' if n>1 else ''} activa{'s' if n>1 else ''}")
-        info.setStyleSheet("color:#444; font-size:10px;")
         leyenda_widget = QWidget()
         leyenda_layout = QHBoxLayout(leyenda_widget)
         leyenda_layout.setContentsMargins(0, 0, 0, 0)
         leyenda_layout.setSpacing(12)
-
         for texto, color in [
-            ("● Normal",    "#639922"),
-            ("● Extraño",   "#378ADD"),
-            ("● Precaución","#EF9F27"),
-            ("⚠ Peligro",  "#E24B4A"),
+            ("Normal",     "#639922"),
+            ("Extrano",    "#378ADD"),
+            ("Precaucion", "#EF9F27"),
+            ("Peligro",    "#E24B4A"),
         ]:
-            lbl = QLabel(texto)
+            lbl = QLabel(f"  {texto}")
             lbl.setStyleSheet(f"color:{color}; font-size:10px;")
             leyenda_layout.addWidget(lbl)
 
+        info = QLabel(
+            f"Legion IA Vision  "
+            f"{n} camara{'s' if n>1 else ''} activa{'s' if n>1 else ''}")
+        info.setStyleSheet("color:#444; font-size:10px;")
         barra.addWidget(leyenda_widget)
-        barra.addWidget(info)
         barra.addStretch()
+        barra.addWidget(info)
         main_layout.addLayout(barra)
 
     def _iniciar_analizadores(self):
@@ -655,39 +673,46 @@ class LegionMonitor(QMainWindow):
             self.analizadores[cam_id] = analizador
 
     def on_nivel_actualizado(self, cam_id, nivel, conf, frame):
-        # Actualizar widget de cámara pequeña
         if cam_id in self.cam_widgets:
             self.cam_widgets[cam_id].actualizar_nivel(nivel, frame)
             self.niveles_actuales[cam_id] = nivel
 
-        # Actualizar principal si es la seleccionada
         if cam_id == self.cam_seleccionada:
             self.principal.actualizar(cam_id, nivel, conf, frame)
 
-        # Verificar si hay peligro en alguna cámara
-        hay_peligro = any(
-            v == "PELIGRO" for v in self.niveles_actuales.values())
-        self.logo.set_alerta(hay_peligro)
+        nivel_max = "VERDE"
+        for v in self.niveles_actuales.values():
+            if PRIORIDAD.index(v) > PRIORIDAD.index(nivel_max):
+                nivel_max = v
+        self.logo.set_nivel_maximo(nivel_max)
 
-        # Actualizar estado header
-        if hay_peligro:
-            self.lbl_estado.setText("⚠ ALERTA — PELIGRO DETECTADO")
-            self.lbl_estado.setStyleSheet("color:#E24B4A; font-size:11px; font-weight:bold;")
-        else:
-            self.lbl_estado.setText(f"● {self.num_camaras} cámaras activas")
-            self.lbl_estado.setStyleSheet("color:#639922; font-size:11px;")
+        mensajes = {
+            "VERDE":    (f"  {self.num_camaras} camaras activas", "#639922"),
+            "AZUL":     ("  Movimiento inusual detectado",         "#378ADD"),
+            "AMARILLO": ("  PRECAUCION  Revisar camaras",          "#EF9F27"),
+            "ROJO":     ("  ALERTA  PELIGRO DETECTADO",            "#E24B4A"),
+        }
+        texto, color = mensajes.get(
+            nivel_max,
+            (f"  {self.num_camaras} camaras activas", "#639922"))
+        self.lbl_estado.setText(texto)
+        self.lbl_estado.setStyleSheet(
+            f"color:{color}; font-size:11px; font-weight:bold;")
 
     def on_cam_click(self, cam_id, color):
         self.cam_seleccionada = cam_id
         self.principal.seleccionar_camara(cam_id, color)
 
     def on_logo_click(self):
-        # Ir a la cámara con mayor peligro
+        nivel_max = "VERDE"
+        cam_max   = 1
         for cam_id, nivel in self.niveles_actuales.items():
-            if nivel == "PELIGRO":
-                self.cam_seleccionada = cam_id
-                self.principal.seleccionar_camara(cam_id, "#E24B4A")
-                break
+            if PRIORIDAD.index(nivel) > PRIORIDAD.index(nivel_max):
+                nivel_max = nivel
+                cam_max   = cam_id
+        color = COLORES[nivel_max]['border']
+        self.cam_seleccionada = cam_max
+        self.principal.seleccionar_camara(cam_max, color)
 
     def closeEvent(self, event):
         for analizador in self.analizadores.values():

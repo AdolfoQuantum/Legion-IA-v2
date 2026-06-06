@@ -7,7 +7,8 @@ from sklearn.metrics import classification_report
 from pathlib import Path
 
 # ============================================================
-# LEGION IA — Entrenamiento LSTM v3 (68 features, 2 personas)
+# LEGION IA — Entrenamiento LSTM v4 (4 clases)
+# VERDE / AZUL / AMARILLO / ROJO
 # ============================================================
 
 BASE    = Path(r"C:\Users\accas\legion-ia")
@@ -15,19 +16,20 @@ DATASET = BASE / "modelos" / "dataset"
 MODELOS = BASE / "modelos"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CLASES = ["SEGURA", "PRECAUCION", "PELIGRO"]
+CLASES = ["VERDE", "AZUL", "AMARILLO", "ROJO"]
 
 print(f"🖥️  Dispositivo: {DEVICE}")
 
-# 1. Cargar dataset v3
-print("\n📂 Cargando dataset v3...")
-X = np.load(DATASET / "X_skeleton_v3.npy")
-y = np.load(DATASET / "y_skeleton_v3.npy")
+# 1. Cargar dataset v4
+print("\n📂 Cargando dataset v4...")
+X = np.load(DATASET / "X_skeleton_v4.npy")
+y = np.load(DATASET / "y_skeleton_v4.npy")
 
-print(f"  X: {X.shape}  ← (muestras, 30 frames, 68 features)")
-print(f"  Clase 0 SEGURA:     {np.sum(y==0)}")
-print(f"  Clase 1 PRECAUCION: {np.sum(y==1)}")
-print(f"  Clase 2 PELIGRO:    {np.sum(y==2)}")
+print(f"  X: {X.shape}")
+print(f"  Clase 0 VERDE:    {np.sum(y==0)}")
+print(f"  Clase 1 AZUL:     {np.sum(y==1)}")
+print(f"  Clase 2 AMARILLO: {np.sum(y==2)}")
+print(f"  Clase 3 ROJO:     {np.sum(y==3)}")
 
 # 2. Dividir dataset
 X_train, X_temp, y_train, y_temp = train_test_split(
@@ -44,14 +46,15 @@ def to_tensor(X, y):
         torch.tensor(X, dtype=torch.float32),
         torch.tensor(y, dtype=torch.long))
 
-train_loader = DataLoader(to_tensor(X_train, y_train), batch_size=32, shuffle=True)
+train_loader = DataLoader(to_tensor(X_train, y_train),
+                          batch_size=32, shuffle=True)
 val_loader   = DataLoader(to_tensor(X_val,   y_val),   batch_size=32)
 test_loader  = DataLoader(to_tensor(X_test,  y_test),  batch_size=32)
 
-# 4. Modelo LSTM v3 (input_size=68)
+# 4. Modelo LSTM v4 (4 clases)
 class LegionLSTM(nn.Module):
     def __init__(self, input_size=68, hidden_size=128,
-                 num_layers=2, num_classes=3):
+                 num_layers=2, num_classes=4):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size,
                             num_layers=num_layers,
@@ -76,7 +79,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, patience=5, factor=0.5)
 
-print(f"\n🧠 Modelo LSTM v3 — input_size=68 (2 personas)")
+print(f"\n🧠 Modelo LSTM v4 — 4 clases (VERDE/AZUL/AMARILLO/ROJO)")
 print(f"  Parámetros: {sum(p.numel() for p in model.parameters()):,}")
 
 # 5. Entrenamiento
@@ -118,7 +121,7 @@ for epoch in range(1, 51):
     if val_acc > mejor_val_acc:
         mejor_val_acc = val_acc
         torch.save(model.state_dict(),
-                   MODELOS / "legion_lstm_v3_best.pth")
+                   MODELOS / "legion_lstm_v4_best.pth")
         paciencia = 0
     else:
         paciencia += 1
@@ -129,7 +132,7 @@ for epoch in range(1, 51):
 # 6. Evaluación final
 print(f"\n📈 Mejor val_accuracy: {mejor_val_acc*100:.2f}%")
 model.load_state_dict(torch.load(
-    MODELOS / "legion_lstm_v3_best.pth",
+    MODELOS / "legion_lstm_v4_best.pth",
     map_location=DEVICE))
 _, test_acc = evaluar(test_loader)
 print(f"  Test accuracy: {test_acc*100:.2f}%")
@@ -144,8 +147,9 @@ with torch.no_grad():
         all_labels.extend(y_b.numpy())
 
 print("\n📋 Reporte por clase:")
-print(classification_report(all_labels, all_preds, target_names=CLASES))
+print(classification_report(all_labels, all_preds,
+      target_names=CLASES))
 
 # 8. Guardar modelo final
-torch.save(model.state_dict(), MODELOS / "legion_lstm_v3_final.pth")
-print("✅ Modelo v3 guardado en modelos/legion_lstm_v3_final.pth")
+torch.save(model.state_dict(), MODELOS / "legion_lstm_v4_final.pth")
+print("✅ Modelo v4 guardado en modelos/legion_lstm_v4_final.pth")
