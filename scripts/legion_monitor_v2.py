@@ -23,27 +23,27 @@ DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 FRAMES_SEQ = 30
 
 UMBRALES = {
-    "VERDE":    0.70,
-    "AZUL":     0.75,
-    "AMARILLO": 0.80,
-    "ROJO":     0.85,
+    "NORMAL":     0.70,
+    "EXTRANO":    0.75,
+    "PRECAUCION": 0.80,
+    "PELIGRO":    0.85,
 }
 
 COLORES = {
-    "VERDE":    {"border": "#639922", "bg": "#0d1f0d", "text": "#639922"},
-    "AZUL":     {"border": "#378ADD", "bg": "#0d1420", "text": "#378ADD"},
-    "AMARILLO": {"border": "#EF9F27", "bg": "#1a1400", "text": "#EF9F27"},
-    "ROJO":     {"border": "#E24B4A", "bg": "#1a0000", "text": "#E24B4A"},
+    "NORMAL":     {"border": "#639922", "bg": "#0d1f0d", "text": "#639922"},
+    "EXTRANO":    {"border": "#378ADD", "bg": "#0d1420", "text": "#378ADD"},
+    "PRECAUCION": {"border": "#EF9F27", "bg": "#1a1400", "text": "#EF9F27"},
+    "PELIGRO":    {"border": "#E24B4A", "bg": "#1a0000", "text": "#E24B4A"},
 }
 
 COLORES_CV = {
-    "VERDE":    (57,  200, 80),
-    "AZUL":     (221, 138, 55),
-    "AMARILLO": (39,  180, 255),
-    "ROJO":     (74,  75,  226),
+    "NORMAL":     (57,  200, 80),
+    "EXTRANO":    (221, 138, 55),
+    "PRECAUCION": (39,  180, 255),
+    "PELIGRO":    (74,  75,  226),
 }
 
-PRIORIDAD = ["VERDE", "AZUL", "AMARILLO", "ROJO"]
+PRIORIDAD = ["NORMAL", "EXTRANO", "PRECAUCION", "PELIGRO"]
 
 IDX_CADERA_IZQ = 11
 IDX_CADERA_DER = 12
@@ -101,11 +101,11 @@ def detectar_caida(boxes):
     return False
 
 def aplicar_umbrales(probs):
-    mapa  = {0: "VERDE", 1: "AZUL", 2: "AMARILLO", 3: "ROJO"}
+    mapa  = {0: "NORMAL", 1: "EXTRANO", 2: "PRECAUCION", 3: "PELIGRO"}
     idx   = np.argmax(probs)
     conf  = probs[idx]
     nivel = mapa[idx]
-    while nivel != "VERDE" and conf < UMBRALES[nivel]:
+    while nivel != "NORMAL" and conf < UMBRALES[nivel]:
         idx_actual = PRIORIDAD.index(nivel)
         nivel = PRIORIDAD[idx_actual - 1]
     return nivel, conf
@@ -146,12 +146,12 @@ def detectar_camaras(max_check=10):
     return camaras
 
 def get_nivel_inicial(idx, total):
-    if total == 1: return "VERDE"
+    if total == 1: return "NORMAL"
     p = idx / total
-    if p < 0.25:   return "VERDE"
-    if p < 0.50:   return "AZUL"
-    if p < 0.75:   return "AMARILLO"
-    return "ROJO"
+    if p < 0.25:   return "NORMAL"
+    if p < 0.50:   return "EXTRANO"
+    if p < 0.75:   return "PRECAUCION"
+    return "PELIGRO"
 
 # ── Analizador por cámara ────────────────────────────────────
 class AnalizadorCamara(QObject):
@@ -224,8 +224,8 @@ class AnalizadorCamara(QObject):
 
                     if ultimo_resultado is not None:
                         if detectar_caida(ultimo_resultado.boxes):
-                            if PRIORIDAD.index(nivel) < PRIORIDAD.index("AMARILLO"):
-                                nivel = "AMARILLO"
+                            if PRIORIDAD.index(nivel) < PRIORIDAD.index("PRECAUCION"):
+                                nivel = "PRECAUCION"
                                 conf  = 0.90
 
                     frame_anot = self._anotar_frame(
@@ -254,7 +254,7 @@ class AnalizadorCamara(QObject):
                 alto  = y2 - y1
                 caida = (alto / (ancho + 1e-6)) < 0.5
 
-                color_p  = COLORES_CV["AMARILLO"] if caida else color
+                color_p  = COLORES_CV["PRECAUCION"] if caida else color
                 etiqueta = f"P{i+1}: CAIDA" if caida else \
                            f"P{i+1}: {nivel} {conf*100:.0f}%"
 
@@ -277,7 +277,6 @@ class AnalizadorCamara(QObject):
                             if px > 0 and py > 0:
                                 cv2.circle(frame, (px, py), 4, color_p, -1)
 
-        # Panel superior sin caracteres especiales
         cv2.rectangle(frame, (0, 0), (w, 36), (0, 0, 0), -1)
         texto_nivel = f"LEGION IA  {nivel}  {conf*100:.0f}%"
         ahora = datetime.now().strftime("%Y/%m/%d  %H:%M:%S")
@@ -396,7 +395,7 @@ class PrincipalWidget(QWidget):
         self.lbl_video.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.lbl_info = QLabel("CAM 01  VERDE")
+        self.lbl_info = QLabel("CAM 01  NORMAL")
         self.lbl_info.setAlignment(Qt.AlignCenter)
         self.lbl_info.setFixedHeight(22)
         self.lbl_info.setStyleSheet(
@@ -458,7 +457,7 @@ class LogoWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.pulso        = True
-        self.nivel_maximo = "VERDE"
+        self.nivel_maximo = "NORMAL"
         self.setFixedHeight(70)
         self.setCursor(Qt.PointingHandCursor)
         self._setup_ui()
@@ -500,7 +499,7 @@ class LogoWidget(QWidget):
 
     def _pulsar(self):
         color_base = COLORES[self.nivel_maximo]['border']
-        pulsa = self.nivel_maximo in ["AMARILLO", "ROJO"]
+        pulsa = self.nivel_maximo in ["PRECAUCION", "PELIGRO"]
 
         if pulsa:
             self.pulso = not self.pulso
@@ -680,17 +679,17 @@ class LegionMonitor(QMainWindow):
         if cam_id == self.cam_seleccionada:
             self.principal.actualizar(cam_id, nivel, conf, frame)
 
-        nivel_max = "VERDE"
+        nivel_max = "NORMAL"
         for v in self.niveles_actuales.values():
             if PRIORIDAD.index(v) > PRIORIDAD.index(nivel_max):
                 nivel_max = v
         self.logo.set_nivel_maximo(nivel_max)
 
         mensajes = {
-            "VERDE":    (f"  {self.num_camaras} camaras activas", "#639922"),
-            "AZUL":     ("  Movimiento inusual detectado",         "#378ADD"),
-            "AMARILLO": ("  PRECAUCION  Revisar camaras",          "#EF9F27"),
-            "ROJO":     ("  ALERTA  PELIGRO DETECTADO",            "#E24B4A"),
+            "NORMAL":     (f"  {self.num_camaras} camaras activas", "#639922"),
+            "EXTRANO":    ("  Movimiento inusual detectado",         "#378ADD"),
+            "PRECAUCION": ("  PRECAUCION  Revisar camaras",          "#EF9F27"),
+            "PELIGRO":    ("  ALERTA  PELIGRO DETECTADO",            "#E24B4A"),
         }
         texto, color = mensajes.get(
             nivel_max,
@@ -704,7 +703,7 @@ class LegionMonitor(QMainWindow):
         self.principal.seleccionar_camara(cam_id, color)
 
     def on_logo_click(self):
-        nivel_max = "VERDE"
+        nivel_max = "NORMAL"
         cam_max   = 1
         for cam_id, nivel in self.niveles_actuales.items():
             if PRIORIDAD.index(nivel) > PRIORIDAD.index(nivel_max):
